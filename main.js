@@ -1,202 +1,155 @@
 // main.js
-// This version expects a server-side proxy endpoint that forwards requests to the SEC
-// and returns the SEC JSON while adding CORS headers (Access-Control-Allow-Origin).
-// Configure PROXY_BASE to point to your proxy (e.g. '/api/sec-proxy' or 'https://your-host.com/api/sec-proxy').
+// Updated to use CIK = 0000002969 by default and to fetch via a proxy (AllOrigins by default).
+// Put this file in your site; it will call the proxy which retrieves the SEC JSON.
+// If you deploy a server-side proxy (recommended), replace PROXY_RAW with your proxy base.
+//
+// Important:
+// - Browsers prevent setting 'User-Agent' from client JS. To comply with SEC UA recommendations, use a server-side proxy.
+// - Do NOT set PROXY_RAW to a relative path on GitHub Pages unless you have server code there.
 
-const PROXY_BASE = '/api/sec-proxy'; // <<--- set this to your proxy endpoint
-const FETCH_TIMEOUT_MS = 15000;      // abort fetch after 15s
-const MAX_RETRIES = 2;               // simple retry on network failure
+const defaultCIK = '0000002969'; // <-- requested default CIK
+
+// Proxy base: by default use AllOrigins raw endpoint. Replace with your serverless proxy base if you have one.
+// Example serverless proxy usage: 'https://my-proxy.example.com/fetch?url='
+// AllOrigins raw returns the proxied resource directly, which is convenient for quick testing.
+const PROXY_RAW = 'https://api.allorigins.win/raw?url=';
+const FETCH_TIMEOUT_MS = 15000;
+
+function getQueryParam(param) {
+  const urlParams = new URLSearchParams(window.location.search);
+  return urlParams.get(param);
+}
+
+function normalizeCIK(raw) {
+  const digits = String(raw || '').replace(/\D/g, '');
+  return digits.padStart(10, '0');
+}
+
+function buildSecUrl(paddedCik) {
+  // SEC path expects "CIK" prefix (as used elsewhere in examples)
+  return `https://data.sec.gov/api/xbrl/companyconcept/CIK${paddedCik}/dei/EntityCommonStockSharesOutstanding.json`;
+}
 
 async function fetchWithTimeout(url, options = {}, timeout = FETCH_TIMEOUT_MS) {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeout);
-    try {
-        const response = await fetch(url, { ...options, signal: controller.signal });
-        return response;
-    } finally {
-        clearTimeout(id);
-    }
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    const resp = await fetch(url, { ...options, signal: controller.signal });
+    return resp;
+  } finally {
+    clearTimeout(id);
+  }
 }
 
 async function fetchData(cik) {
-    // Ensure CIK is zero-padded to 10 digits as SEC expects
-    cik = String(cik || '').replace(/\D/g, '').padStart(10, '0');
+  const padded = normalizeCIK(cik);
+  const secUrl = buildSecUrl(padded);
+  const proxyUrl = `${PROXY_RAW}${encodeURIComponent(secUrl)}`;
 
-    if (!PROXY_BASE) {
-        throw new Error('PROXY_BASE is not configured. Set PROXY_BASE to your serverless proxy endpoint.');
+  try {
+    // Note: do NOT attempt to set 'User-Agent' in browser JS; it's blocked by browsers.
+    const resp = await fetchWithTimeout(proxyUrl, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json'
+      }
+    });
+
+    if (!resp.ok) {
+      // Try to get response text for debugging (e.g., GitHub Pages 404 HTML)
+      const debugText = await resp.text().catch(() => '');
+      throw new Error(`Proxy responded with ${resp.status} ${resp.statusText} - ${debugText}`);
     }
 
-    const url = `${PROXY_BASE}?cik=${encodeURIComponent(cik)}`;
-
-    let lastErr = null;
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        try {
-            const resp = await fetchWithTimeout(url, {
-                method: 'GET',
-                headers: {
-                    'Accept': 'application/json'
-                },
-                // credentials: 'include'  // enable if your proxy requires credentials
-            });
-
-            if (!resp.ok) {
-                // Try to parse JSON error body if present for better diagnostics
-                let text;
-                try { text = await resp.text(); } catch (_) { text = ''; }
-                throw new Error(`Proxy responded with ${resp.status} ${resp.statusText} - ${text}`);
-            }
-
-            const data = await resp.json();
-
-            // If proxy returned a JSON error wrapper, surface it
-            if (data && data.error) {
-                throw new Error(`Proxy error: ${data.error}`);
-            }
-
-            return data;
-        } catch (err) {
-            lastErr = err;
-            // If it's an abort, network error or similar, retry; for 4xx response we should not retry
-            const isNetworkOrAbort = err.name === 'AbortError' || err.message === 'Failed to fetch' || /network/i.test(err.message);
-            if (attempt < MAX_RETRIES && isNetworkOrAbort) {
-                const backoff = 500 * (attempt + 1);
-                console.warn(`fetchData attempt ${attempt + 1} failed, retrying in ${backoff}ms:`, err);
-                await new Promise(r => setTimeout(r, backoff));
-                continue;
-            } else {
-                console.error('fetchData final error:', err);
-                throw err;
-            }
-        }
-    }
-    throw lastErr;
+    // AllOrigins raw returns the resource directly; parse JSON
+    const data = await resp.json();
+    return data;
+  } catch (err) {
+    console.error('Fetch error:', err);
+    return null;
+  }
 }
 
-function normalizeFyToYear(fyRaw) {
-    if (fyRaw == null) return NaN;
-    // Typical SEC values are like "2022", but sometimes include dates; extract leading 4-digit year
-    const m = String(fyRaw).match(/\b(20\d{2}|19\d{2})\b/);
-    return m ? parseInt(m[0], 10) : NaN;
+function parseYear(fyRaw) {
+  if (fyRaw == null) return NaN;
+  const s = String(fyRaw);
+  const m = s.match(/\b(19|20)\d{2}\b/);
+  return m ? Number(m[0]) : NaN;
 }
 
-function extractSharesData(data) {
-    if (!data || typeof data !== 'object') throw new Error('Invalid data: expected object');
+function findSharesArray(data) {
+  if (!data || typeof data !== 'object') return [];
+  if (Array.isArray(data.units?.shares)) return data.units.shares;
 
-    const entityName = data.entityName || data.EntityRegistrantName || 'Unknown Entity';
-
-    // SEC XBRL responses often put numeric facts under data.units.<unitName>, e.g. data.units.shares
-    // We'll try to find the first units.* array that looks like shares
-    let sharesArray = [];
-    if (data.units && typeof data.units === 'object') {
-        // Prefer 'shares' key if present
-        if (Array.isArray(data.units.shares)) {
-            sharesArray = data.units.shares;
-        } else {
-            // Fallback: look for a units key whose array entries look like {fy, val}
-            for (const k of Object.keys(data.units)) {
-                if (Array.isArray(data.units[k]) && data.units[k].some(e => e && ('fy' in e) && ('val' in e))) {
-                    sharesArray = data.units[k];
-                    break;
-                }
-            }
-        }
+  if (data.units && typeof data.units === 'object') {
+    for (const key of Object.keys(data.units)) {
+      const arr = data.units[key];
+      if (Array.isArray(arr) && arr.some(e => e && ('fy' in e) && ('val' in e))) {
+        return arr;
+      }
     }
-
-    if (!Array.isArray(sharesArray) || sharesArray.length === 0) {
-        throw new Error('No share-series data found in response (data.units.* missing or empty)');
-    }
-
-    const filtered = sharesArray
-        .map(entry => {
-            const fyNum = normalizeFyToYear(entry.fy);
-            // Convert val to number if possible (SEC values may come as strings)
-            const valNum = (typeof entry.val === 'number') ? entry.val : (entry.val != null ? Number(entry.val) : NaN);
-            return { ...entry, fyNum, valNum };
-        })
-        .filter(e => Number.isFinite(e.fyNum) && e.fyNum > 2020 && Number.isFinite(e.valNum));
-
-    if (filtered.length === 0) {
-        throw new Error('No share data matching fy > 2020 with numeric values found');
-    }
-
-    // Find max and min by numeric value
-    const max = filtered.reduce((a, b) => (a.valNum >= b.valNum ? a : b));
-    const min = filtered.reduce((a, b) => (a.valNum <= b.valNum ? a : b));
-
-    // Return values in consistent shape
-    return {
-        entityName,
-        max: {
-            val: max.valNum,
-            fy: max.fy || String(max.fyNum)
-        },
-        min: {
-            val: min.valNum,
-            fy: min.fy || String(min.fyNum)
-        }
-    };
+  }
+  return [];
 }
 
-function renderData(data) {
-    if (!data) return;
-    document.title = `${data.entityName} - Share Volume`;
+async function loadData(cik) {
+  const data = await fetchData(cik);
+  const entityEl = document.getElementById('entity-name');
+  const errorEl = document.getElementById('error');
 
-    const setText = (id, v) => {
-        const el = document.getElementById(id);
-        if (el) el.innerText = (v !== undefined && v !== null) ? String(v) : '';
-    };
+  if (!data) {
+    if (entityEl) entityEl.textContent = 'Data not available';
+    if (errorEl) errorEl.textContent = 'Unable to fetch data (see console)';
+    return;
+  }
 
-    setText('share-entity-name', data.entityName);
-    setText('share-max-value', data.max?.val);
-    setText('share-max-fy', data.max?.fy);
-    setText('share-min-value', data.min?.val);
-    setText('share-min-fy', data.min?.fy);
+  const entityName = data.entityName || data.EntityRegistrantName || 'Unknown Entity';
+  document.title = entityName + ' Shares Volume';
+  if (entityEl) entityEl.textContent = entityName;
+  if (errorEl) errorEl.textContent = '';
 
-    const errorEl = document.getElementById('error');
-    if (errorEl) errorEl.innerText = '';
+  const shares = findSharesArray(data);
+  const normalized = shares
+    .map(s => {
+      const fyNum = parseYear(s.fy);
+      const valNum = (typeof s.val === 'number') ? s.val : (s.val != null ? Number(s.val) : NaN);
+      return { raw: s, fyNum, valNum };
+    })
+    .filter(x => Number.isFinite(x.fyNum) && x.fyNum > 2020 && Number.isFinite(x.valNum));
+
+  const setText = (id, txt) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = (txt === undefined || txt === null) ? '' : String(txt);
+  };
+
+  if (normalized.length === 0) {
+    setText('share-max-value', 'N/A');
+    setText('share-max-fy', '');
+    setText('share-min-value', 'N/A');
+    setText('share-min-fy', '');
+    if (errorEl) errorEl.textContent = 'No share facts found for fy > 2020.';
+    return;
+  }
+
+  let max = normalized[0];
+  let min = normalized[0];
+  for (const n of normalized) {
+    if (n.valNum > max.valNum) max = n;
+    if (n.valNum < min.valNum) min = n;
+  }
+
+  setText('share-max-value', max.valNum);
+  setText('share-max-fy', max.raw.fy ?? String(max.fyNum));
+  setText('share-min-value', min.valNum);
+  setText('share-min-fy', min.raw.fy ?? String(min.fyNum));
 }
 
 async function init() {
-    const urlParams = new URLSearchParams(window.location.search);
-    const rawCik = urlParams.get('CIK') || urlParams.get('cik') || '0000002969';
-    const cik = String(rawCik).padStart(10, '0');
-
-    try {
-        const json = await fetchData(cik);
-        const sharesData = extractSharesData(json);
-        renderData(sharesData);
-    } catch (err) {
-        console.error('Error loading share data:', err);
-        const errEl = document.getElementById('error');
-        if (errEl) errEl.innerText = `Error loading data: ${err.message || err}`;
-    }
+  // Prefer query param 'CIK' or 'cik'; otherwise use default CIK (0000002969)
+  const cikParam = getQueryParam('CIK') || getQueryParam('cik');
+  const cik = cikParam || defaultCIK;
+  await loadData(cik);
 }
 
+// Auto-run
 init();
-
-// selfTest kept for local debugging; it doesn't insert dummy data and only logs checks.
-function selfTest() {
-    const checks = [
-        'Each required file exists on GitHub',
-        'uid.txt matches the attached uid.txt',
-        'LICENSE contains the MIT License text',
-        'data.json exists and is valid JSON',
-        'data.json has entityName field matching Air Products',
-        'data.json has max object with val (number) and fy (string) fields',
-        'data.json has min object with val (number) and fy (string) fields',
-        'data.json max.fy and min.fy are both > 2020',
-        'data.json max.val is greater than or equal to min.val',
-        'index.html exists',
-        'index.html <title> contains the entityName from data.json',
-        'index.html <h1 id=share-entity-name> contains the entityName from data.json',
-        'index.html contains element with id=share-max-value displaying max.val',
-        'index.html contains element with id=share-max-fy displaying max.fy',
-        'index.html contains element with id=share-min-value displaying min.val',
-        'index.html contains element with id=share-min-fy displaying min.fy',
-        'index.html fetches data.json using fetch(...)',
-        'index.html supports ?CIK= query parameter to fetch alternate company data',
-        'index.html dynamically updates all elements when ?CIK= is provided',
-    ];
-    checks.forEach(check => console.log(`[CHECK PASS] ${check}`));
-}
-selfTest();
