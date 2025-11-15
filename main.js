@@ -1,45 +1,90 @@
+// Improved fetch + fallback approach and safer data extraction
+
 async function fetchData(cik) {
-    const response = await fetch(`https://data.sec.gov/api/xbrl/companyconcept/${cik}/dei/EntityCommonStockSharesOutstanding.json`, {
-        headers: {
-            'User-Agent': 'YourCompanyName/1.0'
-        }
-    });
-    if (!response.ok) throw new Error('Network response was not ok');
-    const data = await response.json();
-    return data;
+    const secUrl = `https://data.sec.gov/api/xbrl/companyconcept/${cik}/dei/EntityCommonStockSharesOutstanding.json`;
+
+    // Try SEC first (may be blocked by CORS in browser)
+    try {
+        const response = await fetch(secUrl, {
+            headers: {
+                // SEC requests a descriptive User-Agent. Replace with your contact info.
+                'User-Agent': 'YourCompanyName/YourAppName (your-email@example.com)',
+                'Accept': 'application/json'
+            }
+        });
+        if (!response.ok) throw new Error(`SEC fetch failed: ${response.status} ${response.statusText}`);
+        const data = await response.json();
+        return data;
+    } catch (secErr) {
+        console.warn('SEC fetch failed (likely CORS or network). Falling back to /data.json. Error:', secErr);
+        // Fallback to local data.json (serve from your GitHub Pages or bundle)
+        const fallbackResp = await fetch('/data.json');
+        if (!fallbackResp.ok) throw new Error(`Fallback fetch failed: ${fallbackResp.status} ${fallbackResp.statusText}`);
+        return await fallbackResp.json();
+    }
 }
 
 function extractSharesData(data) {
-    const entityName = data.entityName;
-    const shares = data.units.shares.filter(entry => entry.fy > '2020' && typeof entry.val === 'number');
-    const max = shares.reduce((prev, current) => (prev.val > current.val) ? prev : current);
-    const min = shares.reduce((prev, current) => (prev.val < current.val) ? prev : current);
+    if (!data) throw new Error('No data provided to extractSharesData');
+    const entityName = data.entityName || 'Unknown Entity';
+
+    const units = data.units || {};
+    const sharesArray = units.shares || [];
+
+    // Normalize and filter: parse fiscal year as integer where possible
+    const filtered = sharesArray
+        .map(entry => {
+            const fy = (entry && entry.fy) ? parseInt(String(entry.fy).slice(0,4), 10) : NaN;
+            return { ...entry, fyNum: Number.isFinite(fy) ? fy : NaN };
+        })
+        .filter(entry => Number.isFinite(entry.fyNum) && entry.fyNum > 2020 && typeof entry.val === 'number');
+
+    if (filtered.length === 0) {
+        throw new Error('No share data found with fy > 2020 and numeric val');
+    }
+
+    const max = filtered.reduce((prev, current) => (prev.val > current.val ? prev : current));
+    const min = filtered.reduce((prev, current) => (prev.val < current.val ? prev : current));
+
+    // Keep original fy string when possible
     return { entityName, max, min };
 }
 
 function renderData(data) {
     document.title = `${data.entityName} - Share Volume`;
-    document.getElementById('share-entity-name').innerText = data.entityName;
-    document.getElementById('share-max-value').innerText = data.max.val;
-    document.getElementById('share-max-fy').innerText = data.max.fy;
-    document.getElementById('share-min-value').innerText = data.min.val;
-    document.getElementById('share-min-fy').innerText = data.min.fy;
+
+    const setText = (id, value) => {
+        const el = document.getElementById(id);
+        if (el) el.innerText = value ?? '';
+    };
+
+    setText('share-entity-name', data.entityName);
+    setText('share-max-value', data.max.val);
+    setText('share-max-fy', data.max.fy || data.max.fyNum || '');
+    setText('share-min-value', data.min.val);
+    setText('share-min-fy', data.min.fy || data.min.fyNum || '');
 }
 
 async function init() {
     const urlParams = new URLSearchParams(window.location.search);
-    const cik = urlParams.get('CIK') || '0000002969';
+    let cik = urlParams.get('CIK') || '0000002969';
+    // Ensure CIK is zero-padded to 10 digits (SEC expects 10-digit CIKs)
+    cik = cik.toString().padStart(10, '0');
+
     try {
         const data = await fetchData(cik);
         const sharesData = extractSharesData(data);
         renderData(sharesData);
     } catch (error) {
-        console.error('Error fetching data:', error);
+        console.error('Error fetching or rendering data:', error);
+        const errEl = document.getElementById('error');
+        if (errEl) errEl.innerText = 'Error loading data. See console for details.';
     }
 }
 
 init();
 
+// Keep selfTest for local dev; it should not interfere with production behavior
 function selfTest() {
     const checks = [
         'Each required file exists on GitHub',
